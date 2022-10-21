@@ -13,12 +13,13 @@ DATASETS_ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname( __file__ ), '.
 
 
 def get_tensorflow_dataset(dataset: pd.DataFrame, item_features: List[str],
-                           user_id_column: str, date_column: str,
+                           date_column: str, keep_columns: Optional[List[str]] = None,
                            cutoff: int = 40, num_oov_indices: int = 10,
                            ) -> Tuple[Dict[str, tf.Tensor],
                                       Dict[str, tf.keras.layers.StringLookup]]:
-    tf_tensors = {user_id_column: tf.convert_to_tensor(dataset[user_id_column]),# tf.strings.as_string(
-                  date_column: tf.cast(dataset[date_column].values.astype('datetime64[D]').astype(int), tf.int32)}
+    tf_tensors = {date_column: tf.cast(dataset[date_column].values.astype('datetime64[D]').astype(int), tf.int32)}
+    for col in keep_columns:
+        tf_tensors[col] = tf.convert_to_tensor(dataset[col])
     inverse_lookups = {}
     for feature in item_features:
         print(f'Encoding {feature} column')
@@ -56,6 +57,11 @@ def load_inverse_lookups(path):
 @tf.function(experimental_relax_shapes=True)
 def gather_structure(structure, indices):
     return tf.nest.map_structure(lambda x: tf.gather(x, indices), structure)
+
+
+@tf.function(experimental_relax_shapes=True)
+def boolean_mask_structure(structure, mask):
+    return tf.nest.map_structure(lambda x: tf.boolean_mask(x, mask), structure)
 
 
 def enforce_unique_values(dictionary: Dict[Any, str]):
