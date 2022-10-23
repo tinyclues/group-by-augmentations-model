@@ -107,7 +107,8 @@ def _reindex_users(user_index):
     return tf.RaggedTensor.from_row_lengths(tf.range(tf.reduce_sum(lens)), lens)
 
 
-def _restrict_to_user_index_subset(tensors_dict, user_index_subset):
+def restrict_to_user_index_subset(tensors_dict, indices):
+    user_index_subset = tf.gather(tensors_dict['_user_index'], indices)
     res = {'_user_index': _reindex_users(user_index_subset)}
     res.update(gather_structure(keyfilter(lambda x: x not in ['_user_index'], tensors_dict), user_index_subset.values))
     return res
@@ -121,8 +122,7 @@ def batch_by_user(tensors_dict_by_event: Dict[str, Dict[str, tf.Tensor]], target
         local_permutation = permutation[i * batch_size: (i + 1) * batch_size]
         batch = {}
         for table, tensors_dict in tensors_dict_by_event.items():
-            local_user_index = tf.gather(tensors_dict['_user_index'], local_permutation)
-            batch[table] = _restrict_to_user_index_subset(tensors_dict, local_user_index)
+            batch[table] = restrict_to_user_index_subset(tensors_dict, local_permutation)
 
         batch_ds = tf.data.Dataset.from_tensors(batch)
         dataset = batch_ds if i == 0 else dataset.concatenate(batch_ds)
