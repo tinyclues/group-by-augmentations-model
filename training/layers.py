@@ -42,8 +42,8 @@ class WeightedEmbeddings(tf.keras.layers.Embedding):
         such approach also allows to easily calculate higher order moments, for example variance
         """
         nrows = input_tensor.nrows()
-        row_indices = tf.repeat(tf.range(nrows, dtype=tf.int32), input_tensor.row_lengths())
-        column_indices = input_tensor.values
+        row_indices = tf.repeat(tf.range(nrows, dtype=tf.int64), input_tensor.row_lengths())
+        column_indices = tf.cast(input_tensor.values, tf.int64)
         
         if weights is not None:
             # if weights are specified we suppose that weights are aligned with input_tensor
@@ -61,13 +61,15 @@ class WeightedEmbeddings(tf.keras.layers.Embedding):
         
         weights /= tf.reduce_sum(weights, axis=1, keepdims=True)
         
-        indices = tf.cast(tf.stack([row_indices, column_indices], axis=1), tf.int64)
+        indices = tf.stack([row_indices, column_indices], axis=1)
         sparse_indicator = tf.sparse.SparseTensor(indices=indices,
                                                   values=tf.cast(weights.values, tf.float32),
                                                   dense_shape=(nrows, self.input_dim))
         if self.calculate_variance:
-            first_second_moments = tf.sparse.sparse_dense_matmul(sparse_indicator,
-                                                                 tf.concat([self.embeddings, self.embeddings ** 2], -1))
+            first_second_moments = tf.sparse.sparse_dense_matmul(
+                sparse_indicator,
+                tf.concat([self.embeddings, self.embeddings ** 2], -1)
+            )
             mean, second = tf.split(first_second_moments, 2, -1)
             return mean, second - mean ** 2
         return tf.sparse.sparse_dense_matmul(sparse_indicator, self.embeddings)
@@ -85,7 +87,7 @@ def _split_into_smaller_groups(group_by_key: tf.Tensor) -> tf.Tensor:
     
     nb_sub_groups_per_group = count_per_group // median + 1
     # allow to split each group into at most 50 smaller groups
-    max_nb_sub_groups = min(tf.reduce_max(nb_sub_groups_per_group), 50)
+    max_nb_sub_groups = tf.clip_by_value(tf.reduce_max(nb_sub_groups_per_group), 0, 50)
     
     # we remap onto initial indices, so for each value in original group_by_key we know
     # into how many smaller groups it will be split
@@ -133,7 +135,7 @@ class KeyGenerator(tf.keras.layers.Layer):
     def __init__(self, number_of_offer_attributes, average_number_of_attributes_in_key, **kwargs):
         """
         :param number_of_offer_attributes: number of offer attributes in a model
-        :param average_number_of_attributes_in_key: average number of offer attributes that will be used to generate a key
+        :param average_number_of_attributes_in_key: average number of offer attributes to generate a key
         """
         super().__init__(**kwargs)
         average_number_of_attributes_in_key = tf.cast(average_number_of_attributes_in_key, tf.float32)
@@ -141,7 +143,8 @@ class KeyGenerator(tf.keras.layers.Layer):
         
         # we generate more blocks in advance in init to avoid generating non-interesting empty block
         n_to_generate = 30000
-        proba_per_feature_per_block = tf.cast(tf.random.uniform((n_to_generate, number_of_offer_attributes)), tf.float32)
+        proba_per_feature_per_block = tf.cast(tf.random.uniform((n_to_generate, number_of_offer_attributes)),
+                                              tf.float32)
         blocks = tf.ragged.boolean_mask(tf.ragged.range(number_of_offer_attributes * tf.ones(n_to_generate, tf.int32)),
                                         proba_per_feature_per_block < conservation_rate)
         # by filtering empty blocks actually we violate demanded average_number_of_attributes_in_key
@@ -183,7 +186,9 @@ class GroupBy(tf.keras.layers.Layer):
                                    shape (batch size, number of features, embedding dimension)
         """
         unique_values, unique_idx = tf.unique(group_by_key)
-        embeddings_grouped = tf.ragged.stack_dynamic_partitions(stacked_embeddings, unique_idx, tf.shape(unique_values)[0])
+        embeddings_grouped = tf.ragged.stack_dynamic_partitions(stacked_embeddings,
+                                                                unique_idx,
+                                                                tf.shape(unique_values)[0])
         mean, var = tf.nn.moments(embeddings_grouped, axes=1)
         return tf.gather(mean, unique_idx), tf.gather(var, unique_idx)
 
@@ -229,6 +234,7 @@ class kWTA(tf.keras.layers.Layer):
     k-WTA activation layer following https://arxiv.org/pdf/1905.10510.pdf
     """
     def __init__(self, k: int, **kwargs):
+        super().__init__(**kwargs)
         self.k = k
     
     def call(self, input_tensor):
@@ -325,19 +331,29 @@ class BiLinearInteraction(tf.keras.layers.Layer):
                                           (bs, o, d)
     we will learn interaction kernels of dimension (r, d) for each pair of user/offer features (u, o)
     we output resulting interactions for each pair, resulting shape (bs, u * o)
+    
+    We also perform optimized negative examples generation
     """
-    def __init__(self, activation=None, initializer='uniform', regularizer=None, **kwargs):
+    def __init__(self, number_of_negatives, dropout_rate, activation=None, initializer='uniform', regularizer=None, **kwargs):
         super().__init__(**kwargs)
+        self.number_of_negatives = number_of_negatives
+        self.dropout_rate = dropout_rate
         self.activation = tf.keras.activations.get(activation)
         self.initializer = tf.keras.initializers.get(initializer)
         self.regularizer = tf.keras.regularizers.get(regularizer)
 
     def build(self, inputs_shape):
-        user_shape, item_shape = inputs_shape
+        user_shape, offer_shape = inputs_shape
         
-        kernel_shape = (user_shape[-2], item_shape[-2], user_shape[-1], item_shape[-1])
-        bias_shape = (1, user_shape[-2] * item_shape[-2])
-        self.out_shape = (-1, user_shape[-2] * item_shape[-2])
+        self.user_emb_dim = user_shape[-1]
+        self.offer_emb_dim = offer_shape[-1]
+
+        self.n_user_features = user_shape[-2]
+        self.n_offer_features = offer_shape[-2]
+        
+        kernel_shape = (self.n_user_features, self.n_offer_features, self.user_emb_dim, self.offer_emb_dim)
+        bias_shape = (1, self.n_user_features * self.n_offer_features)
+        self.out_shape = (-1, self.n_user_features * self.n_offer_features)
         
         self.interaction_kernel = self.add_weight(
             'interaction_kernel',
@@ -355,8 +371,52 @@ class BiLinearInteraction(tf.keras.layers.Layer):
             trainable=True)
         
         
-    def call(self, inputs):
-        user_embeddings, item_embeddings = inputs
-        res = tf.einsum('...ud,...or,uodr->...uo', user_embeddings, item_embeddings, self.interaction_kernel)
+    def call(self, inputs, generate_negatives, training=None):
+        user_embeddings, offer_embeddings = inputs
+        if training:
+            kernel = tf.nn.dropout(self.interaction_kernel, self.dropout_rate)
+        else:
+            kernel = self.interaction_kernel
+        if generate_negatives:
+            # generation of negative examples inside mini-batches
+            batch_size = tf.shape(user_embeddings)[0]
+            # we split original batch into mini-batches of size (number_of_negatives + 1)
+            minibatch_shape = (batch_size // (self.number_of_negatives + 1), (self.number_of_negatives + 1))
+            user_embeddings = tf.reshape(user_embeddings,
+                                         minibatch_shape + (self.n_user_features, self.user_emb_dim))
+            offer_embeddings = tf.reshape(offer_embeddings,
+                                          minibatch_shape + (self.n_offer_features, self.offer_emb_dim))
+            # for each pair of lines i,j inside minibatch, we consider pairs user/offer
+            # * as positive examples when i==j
+            # * as negative examples otherwise
+            # at the end we flatten mini-batch dimension and obtain batch_size * (number_of_negatives + 1) predictions
+            res = tf.einsum('biur,bjod,uord->bijuo', user_embeddings, offer_embeddings, kernel, optimize='optimal')
+        else:
+            res = tf.einsum('...ur,...od,uord->...uo', user_embeddings, offer_embeddings, kernel, optimize='optimal')
         res = tf.reshape(res, self.out_shape)
         return self.activation(res + self.bias)
+
+
+class DotWithNegatives(tf.keras.layers.Layer):
+    def __init__(self, number_of_negatives, **kwargs):
+        super().__init__(**kwargs)
+        self.number_of_negatives = number_of_negatives
+        
+    def call(self, inputs, generate_negatives):
+        user_embeddings, offer_embeddings = inputs
+        if generate_negatives:
+            # here we will generate negative examples inside mini-batches
+            batch_size = tf.shape(user_embeddings)[0]
+            # we split original batch into mini-batches of size (number_of_negatives + 1)
+            minibatch_shape = (batch_size // (self.number_of_negatives + 1), (self.number_of_negatives + 1), -1)
+            user_embeddings = tf.reshape(user_embeddings, minibatch_shape)
+            offer_embeddings = tf.reshape(offer_embeddings, minibatch_shape)
+            # for each pair of lines i,j inside minibatch, we consider pairs user/offer
+            # * as positive examples when i==j
+            # * as negative examples otherwise
+            # at the end we flatten mini-batch dimension and obtain batch_size * (number_of_negatives + 1) predictions
+            res = tf.einsum('bid,bjd->bij', user_embeddings, offer_embeddings)
+        else:
+            # otherwise we do just scalar product, let's write it in einsum notation too to see a difference between two
+            res = tf.einsum('bd,bd->b', user_embeddings, offer_embeddings)
+        return tf.reshape(res, (-1, 1))
