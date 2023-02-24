@@ -9,6 +9,7 @@ from typing import List, Dict, Tuple, Optional, Any, Union
 
 import numpy as np
 import pandas as pd
+from sklearn.metrics import roc_auc_score
 import tensorflow as tf
 
 DATASETS_ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'datasets'))
@@ -18,10 +19,16 @@ WEIGHT_SUFFIX = '_weight'  # suffix to weight columns used in aggregation
 ADDITIONAL_NEGATIVES = 2  # generate first more negatives than asked and restrict after to avoid collisions
 
 
-def load_inverse_lookups(path: str) -> Dict[str, tf.keras.layers.StringLookup]:
+def load_dataset(dataset_name: str, split: str) -> tf.data.Dataset:
+    path = os.path.join(DATASETS_ROOT_DIR, f'{dataset_name}/aggregated_{split}_dataset.tf')
+    return tf.data.experimental.load(path, compression="GZIP")
+
+
+def load_inverse_lookups(dataset_name: str) -> Dict[str, tf.keras.layers.StringLookup]:
     """
     Load dict with inverse StringLookup transformations saved using `save_inverse_lookups`
     """
+    path = os.path.join(DATASETS_ROOT_DIR, f'{dataset_name}/inverse_lookups.pickle')
     with open(path, 'rb') as f:
         obj = pickle.load(f)
     return {name: tf.keras.layers.StringLookup(vocabulary=vocabulary, invert=True, name=name,
@@ -175,3 +182,99 @@ class BroadcastMetric(tf.keras.metrics.Metric):
 
     def reset_state(self):
         self.metric_obj.reset_state()
+
+
+@tf.function(input_signature=(tf.TensorSpec(shape=(None,), dtype=tf.int32), tf.TensorSpec(shape=(), dtype=tf.float32)))
+def unique_and_cut(x, keep_weight=0.7):
+    if tf.shape(x)[0] == 0:
+        return x, tf.cast(x, tf.float32)
+    val, _, count = tf.unique_with_counts(x)
+
+    weights_order = tf.argsort(count)[::-1]
+    count = tf.cast(count, tf.float32)
+    
+    # we can make it faster if problematic by passing cutoff on number of occurrences instead of keep_weight
+    cut_idx = tf.argmin(tf.cumsum(tf.gather(count, weights_order)) < (tf.reduce_sum(count) * keep_weight))
+    biggest_idx = weights_order[:cut_idx]
+    return tf.gather(val, biggest_idx), tf.linalg.normalize(tf.gather(count, biggest_idx), ord=1)[0]
+
+
+def prepare_single_task_dataset(ds, batch_size, single_task_feature, offer_features, date_column, nb_events_by_user_by_day=8):
+    # tensors_dict will contain flat tensors with values of offer_features for each event
+    tensors_dict = {}
+    for batch in ds:
+        batch = merge_dims(0, 1, keyfilter(offer_features.__contains__, batch))
+        for feature, tensor in batch.items():
+            if feature not in tensors_dict:
+                tensors_dict[feature] = tensor
+            else:
+                tensors_dict[feature] = tf.concat([tensors_dict[feature], tensor], axis=0)
+    
+    group_by_key_tensor = tensors_dict[single_task_feature]
+
+    # performing group by on indices, so then we can just gather other features' values wrt to grouped indicies
+    length = group_by_key_tensor.shape[0]
+    n_keys = tf.reduce_max(group_by_key_tensor) + 1
+    # here we will obtain ragged tensor where line i contains line indices from tensors_dict with group_by_key_tensor == i
+    grouped_indices = tf.ragged.stack_dynamic_partitions(tf.range(length), group_by_key_tensor, n_keys)
+    
+    # now we can gather values of other offer_features
+    task_offer_features = {}
+    for feature in offer_features:
+        if feature == single_task_feature:
+            # nothing to do here, but to simplify further operations we create
+            # * a tensor where line i contains list [i] in ragged dimension
+            # * weight tensor with one element [1.] for each line
+            task_offer_features[feature] = tf.RaggedTensor.from_uniform_row_length(tf.range(n_keys), 1)
+            task_offer_features[f'{feature}{WEIGHT_SUFFIX}'] = task_offer_features[feature]\
+                .with_values(tf.ones(n_keys, dtype=tf.float32))
+        else:
+            # feature_grouped_values will contains grouped values of the feature and we could assign constant 1. weights to them (values can be repeated)
+            feature_grouped_values = tf.gather(tensors_dict[feature], grouped_indices)
+
+            # to optimize calculations instead of repeated values we will
+            # * take unique values of a feature
+            # * remove rare values
+            # * calculate number of events for each value - weights
+            task_offer_features[feature], task_offer_features[f'{feature}{WEIGHT_SUFFIX}'] = \
+                tf.map_fn(unique_and_cut,
+                          feature_grouped_values,
+                          fn_output_signature=(tf.RaggedTensorSpec(shape=[None], dtype=tf.int32),
+                                               tf.RaggedTensorSpec(shape=[None], dtype=tf.float32)))
+    
+    @tf.autograph.experimental.do_not_convert
+    def remap_grouped_features(batch, y):
+        # we can take values here, because we suppose that initally offer features are ragged tensors of uniform length 1
+        key_values = batch[single_task_feature]
+        return {**batch, **gather_structure(task_offer_features, key_values)}, y
+    
+    return rebatch_by_events(ds, batch_size, date_column, nb_events_by_user_by_day).map(remap_grouped_features)
+
+
+def _broadcast_to_generated_negatives(tensor, number_of_negatives):
+    batch_size = tf.shape(tensor)[0]
+    k = number_of_negatives + 1
+    indices_by_mini_batch = tf.reshape(tf.range(batch_size), [batch_size // k, k, -1])
+    return tf.gather(tensor, tf.reshape(tf.repeat(indices_by_mini_batch, k, axis=0), shape=[-1]))
+
+
+def evaluate_model(model, single_task_feature, test_ds, inverse_lookups, number_of_negatives) -> pd.DataFrame:
+    y = tf.zeros([0, 1], dtype=tf.float32)
+    y_pred = tf.zeros([0, 1], dtype=tf.float32)
+    groups = tf.zeros([0], dtype=tf.int32)
+    for batch, y_batch in test_ds[single_task_feature]:
+        y_batch = _response_negatives_in_minibatch(y_batch, number_of_negatives)
+        y_pred = tf.concat([y_pred, model(batch)], axis=0)
+        y = tf.concat([y, y_batch], axis=0)
+        groups_batch = _broadcast_to_generated_negatives(batch[single_task_feature].values,
+                                                         number_of_negatives)
+        groups = tf.concat([groups, groups_batch], axis=0)
+    res = pd.DataFrame({'true': tf.squeeze(y), 'pred': tf.squeeze(y_pred), 'group_idx': groups})
+    res = res\
+        .groupby('group_idx')\
+        .apply(lambda group: roc_auc_score(group.true, group.pred))\
+        .to_frame('auc')
+    res['name'] = pd.Series(inverse_lookups[single_task_feature].get_vocabulary())
+    group_counts = tf.unique_with_counts(groups)
+    res['counts'] = pd.Series(group_counts.count, group_counts.y)
+    return res

@@ -14,7 +14,7 @@ def get_input_layer(name, dtype=tf.int32, row_splits_dtype=tf.int32):
     """
     return tf.keras.layers.Input(name=name,
                                  type_spec=tf.RaggedTensorSpec(shape=[None, None],
-                                                               dtype=tf.int32,
+                                                               dtype=dtype,
                                                                row_splits_dtype=row_splits_dtype))
 
 
@@ -167,6 +167,7 @@ class KeyGenerator(tf.keras.layers.Layer):
             # with 50% probability we will also simulate OR-clause behaviour
             # by splitting big groups into smaller ones
             # and randomly colliding smaller groups
+            # we don't expose it notebook, but it can be varied depending on real client's usage
             return _collide_groups(_split_into_smaller_groups(group_by_keys))
         # otherwise just return obtained keys remapped into values between 0 and number of groups
         return tf.unique(group_by_keys)[1]
