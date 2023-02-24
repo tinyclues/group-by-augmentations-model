@@ -278,3 +278,8 @@ def evaluate_model(model, single_task_feature, test_ds, inverse_lookups, number_
     group_counts = tf.unique_with_counts(groups)
     res['counts'] = pd.Series(group_counts.count, group_counts.y)
     return res
+
+
+def wAUC(auc_df, cutoff=200):
+    auc_df = auc_df[(auc_df['name'] != '[UNK]') & (auc_df['counts'] > cutoff)]
+    return (auc_df['auc'] * auc_df['counts']).sum() / auc_df['counts'].sum()
