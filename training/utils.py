@@ -276,10 +276,10 @@ def evaluate_model(model, single_task_feature, test_ds, inverse_lookups, number_
         .to_frame('auc')
     res['name'] = pd.Series(inverse_lookups[single_task_feature].get_vocabulary())
     group_counts = tf.unique_with_counts(groups)
-    res['counts'] = pd.Series(group_counts.count, group_counts.y)
+    res['number of events'] = pd.Series(group_counts.count, group_counts.y) / (number_of_negatives + 1)
     return res
 
 
 def wAUC(auc_df, cutoff=200):
-    auc_df = auc_df[(auc_df['name'] != '[UNK]') & (auc_df['counts'] > cutoff)]
-    return (auc_df['auc'] * auc_df['counts']).sum() / auc_df['counts'].sum()
+    auc_df = auc_df[(auc_df['name'] != '[UNK]') & (auc_df['number of events'] > cutoff)]
+    return (auc_df['auc'] * auc_df['number of events']).sum() / auc_df['number of events'].sum()
