@@ -186,6 +186,7 @@ class BroadcastMetric(tf.keras.metrics.Metric):
 
 @tf.function(input_signature=(tf.TensorSpec(shape=(None,), dtype=tf.int32), tf.TensorSpec(shape=(), dtype=tf.float32)))
 def unique_and_cut(x, keep_weight=0.7):
+    # TODO debug and remove
     if tf.shape(x)[0] == 0:
         return x, tf.cast(x, tf.float32)
     val, _, count = tf.unique_with_counts(x)
@@ -199,16 +200,28 @@ def unique_and_cut(x, keep_weight=0.7):
     return tf.gather(val, biggest_idx), tf.linalg.normalize(tf.gather(count, biggest_idx), ord=1)[0]
 
 
-def prepare_single_task_dataset(ds, batch_size, single_task_feature, offer_features, date_column, nb_events_by_user_by_day=8):
+@tf.function(input_signature=(tf.TensorSpec(shape=(None,), dtype=tf.int32), tf.TensorSpec(shape=(), dtype=tf.int32)))
+def grouper(x, top=250):
+    # TODO docstring
+    if tf.shape(x)[0] == 0:
+        return x, tf.cast(x, tf.float32)
+    val, _, count = tf.unique_with_counts(x)
+    biggest_idx = tf.argsort(count)[-top:]
+    return tf.gather(val, biggest_idx), tf.cast(tf.linalg.normalize(tf.gather(count, biggest_idx), ord=1)[0], tf.float32)
+
+
+def prepare_single_task_dataset(ds, single_task_feature, offer_features):
+    # ds is coming from rebatch_by_events: batched by events offer features are ragged tensors
     # tensors_dict will contain flat tensors with values of offer_features for each event
     tensors_dict = {}
-    for batch in ds:
-        batch = merge_dims(0, 1, keyfilter(offer_features.__contains__, batch))
-        for feature, tensor in batch.items():
+    for batch, y in ds:
+        for feature, tensor in keyfilter(offer_features.__contains__, batch).items():
+            # we suppose that offer features are ragged tensors of uniform length 1
+            # corresponding to one-hot vectors
             if feature not in tensors_dict:
-                tensors_dict[feature] = tensor
+                tensors_dict[feature] = tensor.values
             else:
-                tensors_dict[feature] = tf.concat([tensors_dict[feature], tensor], axis=0)
+                tensors_dict[feature] = tf.concat([tensors_dict[feature], tensor.values], axis=0)
     
     group_by_key_tensor = tensors_dict[single_task_feature]
 
@@ -230,54 +243,64 @@ def prepare_single_task_dataset(ds, batch_size, single_task_feature, offer_featu
                 .with_values(tf.ones(n_keys, dtype=tf.float32))
         else:
             # feature_grouped_values will contains grouped values of the feature and we could assign constant 1. weights to them (values can be repeated)
-            feature_grouped_values = tf.gather(tensors_dict[feature], grouped_indices)
+            feature_grouped_values = tf.cast(tf.gather(tensors_dict[feature], grouped_indices), tf.int32)
 
             # to optimize calculations instead of repeated values we will
             # * take unique values of a feature
             # * remove rare values
             # * calculate number of events for each value - weights
             task_offer_features[feature], task_offer_features[f'{feature}{WEIGHT_SUFFIX}'] = \
-                tf.map_fn(unique_and_cut,
+                tf.map_fn(grouper,
                           feature_grouped_values,
                           fn_output_signature=(tf.RaggedTensorSpec(shape=[None], dtype=tf.int32),
                                                tf.RaggedTensorSpec(shape=[None], dtype=tf.float32)))
     
     @tf.autograph.experimental.do_not_convert
     def remap_grouped_features(batch, y):
-        # we can take values here, because we suppose that initally offer features are ragged tensors of uniform length 1
-        key_values = batch[single_task_feature]
+        # same assumption here: single_task_feature is a ragged tensor of uniform length 1
+        key_values = batch[single_task_feature].values
         return {**batch, **gather_structure(task_offer_features, key_values)}, y
     
-    return rebatch_by_events(ds, batch_size, date_column, nb_events_by_user_by_day).map(remap_grouped_features)
+    return ds.map(remap_grouped_features)
 
 
-def _broadcast_to_generated_negatives(tensor, number_of_negatives):
-    batch_size = tf.shape(tensor)[0]
+def _broadcast_to_generated_negatives(tensor, number_of_negatives, exclude_collisions=True):
     k = number_of_negatives + 1
-    indices_by_mini_batch = tf.reshape(tf.range(batch_size), [batch_size // k, k, -1])
-    return tf.gather(tensor, tf.reshape(tf.repeat(indices_by_mini_batch, k, axis=0), shape=[-1]))
+    tensor_by_mini_batch = tf.reshape(tensor, [-1, k])
+    broadcasted_tensor = tf.reshape(tf.repeat(tensor_by_mini_batch, k, axis=0), -1)
+    if exclude_collisions:
+        collisions = (tf.expand_dims(tensor_by_mini_batch, axis=2) == tf.expand_dims(tensor_by_mini_batch, axis=1))
+        response = tf.expand_dims(tf.eye(k, dtype=tf.bool), 0)
+        # we keep either positive examples, either negative examples with different value of tensor
+        keep_mask = tf.reshape(response | ~collisions, -1)
+        return tf.boolean_mask(broadcasted_tensor, keep_mask), keep_mask
+    return broadcasted_tensor, tf.ones_like(broadcasted_tensor, tf.bool)
 
 
-def evaluate_model(model, single_task_feature, test_ds, inverse_lookups, number_of_negatives) -> pd.DataFrame:
+def evaluate_model(model, single_task_feature, test_ds, number_of_negatives,
+                   inverse_lookups: Optional[dict] = None) -> pd.DataFrame:
     y = tf.zeros([0, 1], dtype=tf.float32)
     y_pred = tf.zeros([0, 1], dtype=tf.float32)
     groups = tf.zeros([0], dtype=tf.int32)
     for batch, y_batch in test_ds[single_task_feature]:
+        groups_batch, keep_mask = _broadcast_to_generated_negatives(batch[single_task_feature].values,
+                                                                    number_of_negatives)
+        groups = tf.concat([groups, tf.cast(groups_batch, tf.int32)], axis=0)
+        
         y_batch = _response_negatives_in_minibatch(y_batch, number_of_negatives)
-        y_pred = tf.concat([y_pred, model(batch)], axis=0)
-        y = tf.concat([y, y_batch], axis=0)
-        groups_batch = _broadcast_to_generated_negatives(batch[single_task_feature].values,
-                                                         number_of_negatives)
-        groups = tf.concat([groups, groups_batch], axis=0)
+        y = tf.concat([y, tf.boolean_mask(y_batch, keep_mask)], axis=0)
+        
+        y_pred = tf.concat([y_pred, tf.boolean_mask(model(batch), keep_mask)], axis=0)
 
-    res = pd.DataFrame({'true': tf.squeeze(y), 'pred': tf.squeeze(y_pred), 'group_idx': groups})
-    res = res\
+        
+    all_preds = pd.DataFrame({'true': tf.squeeze(y), 'pred': tf.squeeze(y_pred), 'group_idx': groups})
+    res = all_preds\
         .groupby('group_idx')\
         .apply(lambda group: roc_auc_score(group.true, group.pred))\
         .to_frame('auc')
-    res['name'] = pd.Series(inverse_lookups[single_task_feature].get_vocabulary())
-    group_counts = tf.unique_with_counts(groups)
-    res['number of events'] = pd.Series(group_counts.count, group_counts.y) / (number_of_negatives + 1)
+    if inverse_lookups:
+        res['name'] = pd.Series(inverse_lookups[single_task_feature].get_vocabulary())
+    res['number of events'] = all_preds[all_preds['true'] == 1].groupby('group_idx')['group_idx'].count()
     return res
 
 
