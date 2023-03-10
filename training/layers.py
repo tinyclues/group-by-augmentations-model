@@ -4,6 +4,8 @@ https://github.com/tinyclues/recsys-multi-atrribute-benchmark/blob/master/traini
 """
 from typing import Optional
 
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import tensorflow as tf
 import tensorflow_probability as tfp
 

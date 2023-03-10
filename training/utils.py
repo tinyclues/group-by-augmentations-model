@@ -10,6 +10,8 @@ from typing import List, Dict, Tuple, Optional, Any, Union
 import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import tensorflow as tf
 
 DATASETS_ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'datasets'))
