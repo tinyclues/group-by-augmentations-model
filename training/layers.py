@@ -165,9 +165,9 @@ class KeyGenerator(tf.keras.layers.Layer):
             tf.strings.as_string(tf.gather(stacked_raw_attributes, chosen_attributes, axis=1)),
             axis=1, separator=',')
         group_by_keys = tf.strings.to_hash_bucket_fast(group_by_keys, tf.int32.max)
-        if tf.random.uniform(()) < 0.:
+        if tf.random.uniform(()) < 0.4:
             # TODO reactivate
-            # with 50% probability we will also simulate OR-clause behaviour
+            # with 40% probability we will also simulate OR-clause behaviour
             # by splitting big groups into smaller ones
             # and randomly colliding smaller groups
             # we don't expose it notebook, but it can be varied depending on real client's usage
