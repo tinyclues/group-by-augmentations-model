@@ -1,4 +1,5 @@
 import os
+import logging
 import pickle
 
 from functools import partial
@@ -11,7 +12,19 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
 
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
+def silence_tensorflow():
+    """
+    Silence every unnecessary warning from tensorflow from https://github.com/LucaCappelletti94/silence_tensorflow
+    """
+    logging.getLogger('tensorflow').setLevel(logging.ERROR)
+    os.environ["KMP_AFFINITY"] = "noverbose"
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+    import tensorflow as tf
+    tf.get_logger().setLevel('ERROR')
+    tf.autograph.set_verbosity(3)
+
+silence_tensorflow()
 import tensorflow as tf
 
 DATASETS_ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'datasets'))
@@ -23,6 +36,9 @@ ADDITIONAL_NEGATIVES = 2  # generate first more negatives than asked and restric
 
 def load_dataset(dataset_name: str, split: str) -> tf.data.Dataset:
     path = os.path.join(DATASETS_ROOT_DIR, f'{dataset_name}/aggregated_{split}_dataset.tf')
+    # in newer versions of tf:
+    # return tf.data.Dataset.load(path, compression="GZIP")
+    
     return tf.data.experimental.load(path, compression="GZIP")
 
 
@@ -212,7 +228,8 @@ def grouper(x, top=250):
     return tf.gather(val, biggest_idx), tf.cast(tf.linalg.normalize(tf.gather(count, biggest_idx), ord=1)[0], tf.float32)
 
 
-def prepare_single_task_dataset(ds, single_task_feature, offer_features):
+
+def get_task_offer_features(ds, single_task_feature, offer_features):
     # ds is coming from rebatch_by_events: batched by events offer features are ragged tensors
     # tensors_dict will contain flat tensors with values of offer_features for each event
     tensors_dict = {}
@@ -257,6 +274,27 @@ def prepare_single_task_dataset(ds, single_task_feature, offer_features):
                           fn_output_signature=(tf.RaggedTensorSpec(shape=[None], dtype=tf.int32),
                                                tf.RaggedTensorSpec(shape=[None], dtype=tf.float32)))
     
+    return task_offer_features
+
+
+def remap_features_using_key(ds, key, features_to_update):
+    @tf.autograph.experimental.do_not_convert
+    def remap_features(batch, y):
+        # same assumption here: single_task_feature is a ragged tensor of uniform length 1
+        key_values = batch[key].values
+        return {**batch, **gather_structure(features_to_update, key_values)}, y
+    
+    return ds.map(remap_features)
+
+
+def prepare_single_task_dataset(ds, single_task_feature, offer_features):
+    task_offer_features = get_task_offer_features(ds, single_task_feature, offer_features)
+    return remap_features_using_key(ds, single_task_feature, task_offer_features)
+
+
+def prepare_single_task_dataset(ds, single_task_feature, offer_features):
+    task_offer_features = get_task_offer_features(ds, single_task_feature, offer_features)
+    
     @tf.autograph.experimental.do_not_convert
     def remap_grouped_features(batch, y):
         # same assumption here: single_task_feature is a ragged tensor of uniform length 1
@@ -279,12 +317,12 @@ def _broadcast_to_generated_negatives(tensor, number_of_negatives, exclude_colli
     return broadcasted_tensor, tf.ones_like(broadcasted_tensor, tf.bool)
 
 
-def evaluate_model(model, single_task_feature, test_ds, number_of_negatives,
+def evaluate_model(model, single_task_feature, test_datasets, number_of_negatives,
                    inverse_lookups: Optional[dict] = None) -> pd.DataFrame:
     y = tf.zeros([0, 1], dtype=tf.float32)
     y_pred = tf.zeros([0, 1], dtype=tf.float32)
     groups = tf.zeros([0], dtype=tf.int32)
-    for batch, y_batch in test_ds[single_task_feature]:
+    for batch, y_batch in test_datasets[single_task_feature]:
         groups_batch, keep_mask = _broadcast_to_generated_negatives(batch[single_task_feature].values,
                                                                     number_of_negatives)
         groups = tf.concat([groups, tf.cast(groups_batch, tf.int32)], axis=0)
@@ -306,6 +344,17 @@ def evaluate_model(model, single_task_feature, test_ds, number_of_negatives,
     return res
 
 
-def wAUC(auc_df, cutoff=200):
-    auc_df = auc_df[(auc_df['name'] != '[UNK]') & (auc_df['number of events'] > cutoff)]
-    return (auc_df['auc'] * auc_df['number of events']).sum() / auc_df['number of events'].sum()
+def save_metrics(metrics, dataset_name, file_name):
+    path = os.path.join(DATASETS_ROOT_DIR, f'{dataset_name}/metrics/{file_name}.pickle')
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, 'wb') as f:
+        pickle.dump(metrics, f)
+
+
+def wAUC(auc_df, cutoff_low=None, cutoff_high=None):
+    idx = (auc_df['name'] != '[UNK]')
+    if cutoff_low:
+        idx = idx & (auc_df['number of events'] > cutoff_low)
+    if cutoff_high:
+        idx = idx & (auc_df['number of events'] <= cutoff_high)
+    return (auc_df[idx]['auc'] * auc_df[idx]['number of events']).sum() / auc_df[idx]['number of events'].sum()

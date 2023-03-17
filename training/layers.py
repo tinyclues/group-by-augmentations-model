@@ -5,7 +5,10 @@ https://github.com/tinyclues/recsys-multi-atrribute-benchmark/blob/master/traini
 from typing import Optional
 
 import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
+from utils import silence_tensorflow
+
+silence_tensorflow()
 import tensorflow as tf
 import tensorflow_probability as tfp
 
@@ -399,31 +402,6 @@ class BiLinearInteraction(tf.keras.layers.Layer):
             res = tf.einsum('...ur,...od,uord->...uo', user_embeddings, offer_embeddings, kernel, optimize='optimal')
         res = tf.reshape(res, self.out_shape)
         return self.activation(res + self.bias)
-
-
-class DotWithNegatives(tf.keras.layers.Layer):
-    def __init__(self, number_of_negatives, **kwargs):
-        super().__init__(**kwargs)
-        self.number_of_negatives = number_of_negatives
-        
-    def call(self, inputs, generate_negatives):
-        user_embeddings, offer_embeddings = inputs
-        if generate_negatives:
-            # here we will generate negative examples inside mini-batches
-            batch_size = tf.shape(user_embeddings)[0]
-            # we split original batch into mini-batches of size (number_of_negatives + 1)
-            minibatch_shape = (batch_size // (self.number_of_negatives + 1), (self.number_of_negatives + 1), -1)
-            user_embeddings = tf.reshape(user_embeddings, minibatch_shape)
-            offer_embeddings = tf.reshape(offer_embeddings, minibatch_shape)
-            # for each pair of lines i,j inside minibatch, we consider pairs user/offer
-            # * as positive examples when i==j
-            # * as negative examples otherwise
-            # at the end we flatten mini-batch dimension and obtain batch_size * (number_of_negatives + 1) predictions
-            res = tf.einsum('bid,bjd->bij', user_embeddings, offer_embeddings)
-        else:
-            # otherwise we do just scalar product, let's write it in einsum notation too to see a difference between two
-            res = tf.einsum('bd,bd->b', user_embeddings, offer_embeddings)
-        return tf.reshape(res, (-1, 1))
 
 
 class DotWithNegatives(tf.keras.layers.Layer):
