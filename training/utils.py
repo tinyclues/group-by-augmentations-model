@@ -292,18 +292,6 @@ def prepare_single_task_dataset(ds, single_task_feature, offer_features):
     return remap_features_using_key(ds, single_task_feature, task_offer_features)
 
 
-def prepare_single_task_dataset(ds, single_task_feature, offer_features):
-    task_offer_features = get_task_offer_features(ds, single_task_feature, offer_features)
-    
-    @tf.autograph.experimental.do_not_convert
-    def remap_grouped_features(batch, y):
-        # same assumption here: single_task_feature is a ragged tensor of uniform length 1
-        key_values = batch[single_task_feature].values
-        return {**batch, **gather_structure(task_offer_features, key_values)}, y
-    
-    return ds.map(remap_grouped_features)
-
-
 def _broadcast_to_generated_negatives(tensor, number_of_negatives, exclude_collisions=True):
     k = number_of_negatives + 1
     tensor_by_mini_batch = tf.reshape(tensor, [-1, k])
@@ -332,7 +320,6 @@ def evaluate_model(model, single_task_feature, test_datasets, number_of_negative
         
         y_pred = tf.concat([y_pred, tf.boolean_mask(model(batch), keep_mask)], axis=0)
 
-        
     all_preds = pd.DataFrame({'true': tf.squeeze(y), 'pred': tf.squeeze(y_pred), 'group_idx': groups})
     res = all_preds\
         .groupby('group_idx')\
